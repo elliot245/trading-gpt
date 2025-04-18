@@ -1,0 +1,18 @@
+{
+  "project": {
+    "name": "Trading-GPT",
+    "description": "Trading-GPT是一个智能交易系统，结合了大语言模型和交易策略，用于自动化交易决策。"
+  },
+  "memories": [
+    {
+      "id": "1",
+      "timestamp": "2023-04-18T23:00:00Z",
+      "content": "正在为Trading-GPT项目编写技术方案文档，已完成需求描述、需求分析和概要设计部分，正准备编写详细设计部分。"
+    },
+    {
+      "id": "2",
+      "timestamp": "2023-04-18T23:05:00Z",
+      "content": "User prefers to review the detailed design one module at a time rather than all at once."
+    }
+  ]
+}
