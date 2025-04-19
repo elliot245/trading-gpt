@@ -16,6 +16,7 @@ import (
 	"github.com/yubing744/trading-gpt/pkg/chat"
 	"github.com/yubing744/trading-gpt/pkg/chat/feishu"
 	"github.com/yubing744/trading-gpt/pkg/llms"
+	"github.com/yubing744/trading-gpt/pkg/memory"
 	"github.com/yubing744/trading-gpt/pkg/prompt"
 	"github.com/yubing744/trading-gpt/pkg/utils/xtemplate"
 
@@ -74,6 +75,12 @@ type Strategy struct {
 	world        *env.Environment
 	agent        agents.IAgent
 	chatSessions *chat.ChatSessions
+
+	// memory module
+	memoryManager   memory.IMemoryManager
+	memoryRetriever memory.IMemoryRetriever
+	memoryTriggers  []memory.IMemoryTrigger
+	memoryEnabled   bool
 }
 
 // ID should return the identity of this strategy
@@ -164,6 +171,12 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	// Setup Notify
 	err = s.setupNotify(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Setup Memory
+	err = s.setupMemory(ctx)
 	if err != nil {
 		return err
 	}
@@ -292,6 +305,53 @@ func (s *Strategy) setupNotify(ctx context.Context) error {
 	return nil
 }
 
+func (s *Strategy) setupMemory(ctx context.Context) error {
+	// 检查是否启用记忆功能
+	s.memoryEnabled = s.Memory.Enabled
+	if !s.memoryEnabled {
+		log.Info("memory module is disabled")
+		return nil
+	}
+
+	// 设置默认值
+	if s.Memory.FilePath == "" {
+		s.Memory.FilePath = "data/memories.md"
+	}
+	if s.Memory.MaxResults <= 0 {
+		s.Memory.MaxResults = 5
+	}
+
+	// 创建记忆管理器
+	memoryManager := memory.NewMemoryManager(s.Memory.FilePath)
+	s.memoryManager = memoryManager
+
+	// 初始化记忆管理器
+	if err := memoryManager.Initialize(ctx); err != nil {
+		return errors.Wrap(err, "failed to initialize memory manager")
+	}
+
+	// 创建记忆检索器
+	memoryRetriever := memory.NewMemoryRetriever(memoryManager, s.llm)
+	s.memoryRetriever = memoryRetriever
+
+	// 添加记忆触发器
+	s.memoryTriggers = make([]memory.IMemoryTrigger, 0)
+
+	// 添加交易完成触发器
+	s.memoryTriggers = append(s.memoryTriggers, memory.NewTradeCompleteTrigger())
+
+	// 如果启用了定期反思，添加定期触发器
+	if s.Memory.Periodic.Enabled {
+		if s.Memory.Periodic.Interval <= 0 {
+			s.Memory.Periodic.Interval = 24 * time.Hour // 默认为24小时
+		}
+		s.memoryTriggers = append(s.memoryTriggers, memory.NewPeriodicTrigger(s.Memory.Periodic.Interval))
+	}
+
+	log.Info("memory module initialized successfully")
+	return nil
+}
+
 func (s *Strategy) setupChat(ctx context.Context) error {
 	feishuCfg := s.Chat.Feishu
 	if feishuCfg != nil && feishuCfg.Enabled {
@@ -370,6 +430,38 @@ func (s *Strategy) agentAction(ctx context.Context, chatSession ttypes.ISession,
 	s.replyMsg(ctx, chatSession, fmt.Sprintf("The agent start action at %s, and the msgs:", time.Now().Format(time.RFC3339)))
 	for _, msg := range msgs {
 		s.replyMsg(ctx, chatSession, msg.Text)
+	}
+
+	// 检索相关记忆
+	if s.memoryEnabled {
+		// 提取当前情境
+		situation := ""
+		if len(msgs) > 0 {
+			situation = msgs[len(msgs)-1].Text
+		}
+
+		// 检索相关记忆
+		memories, err := s.memoryRetriever.RetrieveRelevantMemories(ctx, situation, s.Memory.MaxResults)
+		if err != nil {
+			log.WithError(err).Warn("failed to retrieve relevant memories")
+		} else if len(memories) > 0 {
+			// 构建记忆提示
+			memoryPrompt := "\n\n以下是一些相关的历史交易经验，可以参考：\n"
+			for i, memory := range memories {
+				memoryPrompt += fmt.Sprintf("\n经验 %d: %s\n%s\n", i+1, memory.Title, memory.Content)
+			}
+
+			// 添加记忆提示到消息中
+			msgs = append(msgs, &ttypes.Message{
+				Text: memoryPrompt,
+			})
+
+			// 显示检索到的记忆
+			s.replyMsg(ctx, chatSession, fmt.Sprintf("Found %d relevant memories:", len(memories)))
+			for _, memory := range memories {
+				s.replyMsg(ctx, chatSession, fmt.Sprintf("- %s", memory.Title))
+			}
+		}
 	}
 
 	resp, err := s.agent.GenActions(ctx, chatSession, msgs)
@@ -558,13 +650,59 @@ func (s *Strategy) handleFngChanged(ctx context.Context, session ttypes.ISession
 	})
 }
 
-func (s *Strategy) handlePositionChanged(_ctx context.Context, session ttypes.ISession, position *exchange.PositionX) {
+func (s *Strategy) handlePositionChanged(ctx context.Context, session ttypes.ISession, position *exchange.PositionX) {
 	log.WithField("position", position).Info("handle position changed")
 
 	msg := "There are currently no open positions"
 
 	kline, ok := s.getKline(session)
 	if ok {
+		// 检查是否是交易完成事件（从有仓位到无仓位）
+		prevPosition, hasPrevPosition := session.GetAttribute("prev_position")
+		var isTradeComplete bool
+		if hasPrevPosition {
+			prevPos := prevPosition.(*exchange.PositionX)
+			isTradeComplete = prevPos.IsOpened(kline.GetClose()) && !position.IsOpened(kline.GetClose())
+		}
+
+		// 保存当前仓位状态，用于下次比较
+		session.SetAttribute("prev_position", position)
+
+		// 如果是交易完成事件，触发记忆创建
+		if isTradeComplete && s.memoryEnabled {
+			log.Info("trade complete detected, triggering memory creation")
+
+			// 构建交易结果数据
+			tradeResult := map[string]interface{}{
+				"symbol": s.Symbol,
+				"side": func() string {
+					if prevPosition.(*exchange.PositionX).IsLong() {
+						return "long"
+					}
+					return "short"
+				}(),
+				"profit":         prevPosition.(*exchange.PositionX).AccumulatedProfit.Float64(),
+				"holding_period": prevPosition.(*exchange.PositionX).GetHoldingPeriod(),
+			}
+
+			// 处理事件，触发记忆创建
+			for _, trigger := range s.memoryTriggers {
+				if trigger.GetTriggerType() == memory.TriggerTypeTradeComplete && trigger.ShouldTrigger(ctx, tradeResult) {
+					// 获取反思提示
+					prompt, err := trigger.GetReflectionPrompt(ctx, tradeResult)
+					if err != nil {
+						log.WithError(err).Error("failed to get reflection prompt")
+						continue
+					}
+
+					// 创建记忆
+					if err := s.createMemoryFromReflection(ctx, prompt, trigger.GetTriggerType()); err != nil {
+						log.WithError(err).Error("failed to create memory from reflection")
+					}
+				}
+			}
+		}
+
 		if position.IsOpened(kline.GetClose()) {
 			side := "short"
 			if position.IsLong() {
@@ -676,4 +814,89 @@ func (s *Strategy) getPositionMsg(session ttypes.ISession) (*ttypes.Message, boo
 	}
 
 	return nil, false
+}
+
+// createMemoryFromReflection 从反思创建记忆
+func (s *Strategy) createMemoryFromReflection(ctx context.Context, prompt string, triggerType string) error {
+	if !s.memoryEnabled {
+		return nil
+	}
+
+	// 直接调用 LLM 生成反思
+	resp, err := s.llm.Call(ctx, fmt.Sprintf("你是一个交易反思助手，负责总结交易经验和教训。\n\n%s", prompt))
+	if err != nil {
+		return errors.Wrap(err, "failed to generate reflection")
+	}
+
+	if resp == "" {
+		return errors.New("empty response from LLM")
+	}
+
+	// 解析反思内容
+	title, content, tags, importance, err := s.parseReflection(resp)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse reflection")
+	}
+
+	// 添加记忆
+	_, err = s.memoryManager.AddMemory(ctx, title, content, tags, triggerType, importance)
+	return err
+}
+
+// parseReflection 解析反思内容，提取标题、内容、标签和重要性
+func (s *Strategy) parseReflection(reflection string) (string, string, []string, int, error) {
+	var title string
+	var content string
+	var tagsStr string
+	var importance int
+
+	// 默认值
+	title = fmt.Sprintf("反思 %s", time.Now().Format("2006-01-02"))
+	content = reflection
+	tagsStr = "反思"
+	importance = 5
+
+	// 尝试解析格式化的反思
+	lines := strings.Split(reflection, "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "标题：") || strings.HasPrefix(line, "标题:") {
+			title = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "标题："), "标题:"))
+		} else if strings.HasPrefix(line, "标签：") || strings.HasPrefix(line, "标签:") {
+			tagsStr = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "标签："), "标签:"))
+		} else if strings.HasPrefix(line, "重要性：") || strings.HasPrefix(line, "重要性:") {
+			importanceStr := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "重要性："), "重要性:"))
+			fmt.Sscanf(importanceStr, "%d", &importance)
+		} else if strings.HasPrefix(line, "内容：") || strings.HasPrefix(line, "内容:") {
+			// 内容从下一行开始
+			if i+1 < len(lines) {
+				content = strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+				break
+			}
+		}
+	}
+
+	// 解析标签
+	tags := make([]string, 0)
+	for _, tag := range strings.Split(tagsStr, ",") {
+		tag = strings.TrimSpace(tag)
+		if tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+
+	// 确保重要性在1-10范围内
+	if importance < 1 {
+		importance = 1
+	} else if importance > 10 {
+		importance = 10
+	}
+
+	// 如果没有提取到标题，使用UUID的前8位作为标题
+	if title == "" {
+		title = fmt.Sprintf("反思 %s", uuid.New().String()[:8])
+	}
+
+	return title, content, tags, importance, nil
 }

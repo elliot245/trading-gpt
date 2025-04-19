@@ -17,6 +17,7 @@ type Config struct {
 	Chat   ChatConfig   `json:"chat"`
 	Agent  AgentConfig  `json:"agent"`
 	Env    EnvConfig    `json:"env"`
+	Memory MemoryConfig `json:"memory"`
 
 	Strategy                string   `json:"strategy"`
 	StrategyAttentionPoints []string `json:"strategy_attention_points"`
