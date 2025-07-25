@@ -11,19 +11,19 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// MockEventEmitter implements a simple event emitter for testing
+// MockEventEmitter implements EventEmitter for testing
 type MockEventEmitter struct {
-	events []interface{}
+	events []ttypes.IEvent
 	mu     sync.Mutex
 }
 
-func (m *MockEventEmitter) emit(event interface{}) {
+func (m *MockEventEmitter) Emit(event ttypes.IEvent) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, event)
 }
 
-func (m *MockEventEmitter) getEvents() []interface{} {
+func (m *MockEventEmitter) GetEvents() []ttypes.IEvent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.events
@@ -98,29 +98,12 @@ func TestPositionClosedEventDataToPrompts(t *testing.T) {
 	assert.Contains(t, promptsLoss[0], "Close Reason: StopLoss")
 }
 
-func TestPositionCloseEventEmission(t *testing.T) {
+// TestEventEmitter tests that our event emitter works correctly
+func TestEventEmitter(t *testing.T) {
 	// Create a mock event emitter
 	emitter := &MockEventEmitter{
-		events: make([]interface{}, 0),
+		events: make([]ttypes.IEvent, 0),
 	}
-
-	// Create a test position
-	position := &types.Position{
-		Symbol:      "BTCUSDT",
-		Base:        fixedpoint.NewFromFloat(1.0),
-		AverageCost: fixedpoint.NewFromFloat(50000.0),
-	}
-
-	// Create position X wrapper
-	positionX := NewPositionX(position)
-	positionX.AccumulatedProfit = fixedpoint.NewFromFloat(1000.0)
-
-	// Create a KLineWindow with one kline for exit price
-	kLineWindow := &types.KLineWindow{}
-	kLineWindow.Add(types.KLine{
-		Symbol: "BTCUSDT",
-		Close:  fixedpoint.NewFromFloat(51000.0),
-	})
 
 	// Create position closed event data
 	positionData := PositionClosedEventData{
@@ -136,14 +119,13 @@ func TestPositionCloseEventEmission(t *testing.T) {
 
 	// Emit the event through our mock emitter
 	event := NewPositionClosedEvent(positionData)
-	emitter.emit(event)
+	emitter.Emit(event)
 
 	// Verify the event was emitted correctly
-	events := emitter.getEvents()
+	events := emitter.GetEvents()
 	assert.Len(t, events, 1)
 
-	emittedEvent, ok := events[0].(*ttypes.Event)
-	assert.True(t, ok)
+	emittedEvent := events[0]
 	assert.Equal(t, EventPositionClosed, emittedEvent.GetType())
 
 	data := emittedEvent.GetData()
@@ -158,46 +140,57 @@ func TestPositionCloseEventEmission(t *testing.T) {
 	assert.Equal(t, CloseReasonManual, positionClosedData.CloseReason)
 }
 
-// TestEventFromTradeCollector tests that the event is properly created when position is closed
-// This simulates the OnPositionUpdate callback in the Run method
-func TestEventFromTradeCollector(t *testing.T) {
-	// Create a channel to receive events like in the real implementation
-	eventCh := make(chan ttypes.IEvent, 10)
-
-	// Create position closed event data similar to what would be created in the OnPositionUpdate callback
-	positionData := PositionClosedEventData{
-		StrategyID:    "test_strategy",
-		Symbol:        "BTCUSDT",
-		EntryPrice:    50000.0,
-		ExitPrice:     51000.0,
-		Quantity:      1.0,
-		ProfitAndLoss: 1000.0,
-		CloseReason:   CloseReasonManual,
-		Timestamp:     time.Now(),
+// TestCreatePositionClosedEvent tests the createPositionClosedEvent method
+func TestCreatePositionClosedEvent(t *testing.T) {
+	// Create a minimal ExchangeEntity for testing
+	entity := &ExchangeEntity{
+		symbol: "BTCUSDT",
+		position: &PositionX{
+			Position: &types.Position{
+				Symbol:      "BTCUSDT",
+				Base:        fixedpoint.NewFromFloat(1.0),
+				AverageCost: fixedpoint.NewFromFloat(50000.0),
+			},
+		},
 	}
 
-	// Create and emit the event like in the real implementation
-	go func() {
-		event := NewPositionClosedEvent(positionData)
-		eventCh <- event
-	}()
+	// Set accumulated profit
+	entity.position.AccumulatedProfit = fixedpoint.NewFromFloat(1000.0)
 
-	// Check that an event was sent to the channel
-	select {
-	case event := <-eventCh:
-		// Verify it's a position closed event
-		assert.Equal(t, EventPositionClosed, event.GetType())
-		
-		data := event.GetData()
-		if positionData, ok := data.(PositionClosedEventData); ok {
-			assert.Equal(t, "BTCUSDT", positionData.Symbol)
-			assert.Equal(t, 50000.0, positionData.EntryPrice)
-			assert.Equal(t, 51000.0, positionData.ExitPrice)
-			assert.Equal(t, CloseReasonManual, positionData.CloseReason)
-		} else {
-			t.Errorf("Event data is not PositionClosedEventData, got %T", data)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("No event received within timeout")
+	// Create a KLineWindow with one kline for exit price
+	kLineWindow := &types.KLineWindow{}
+	kLineWindow.Add(types.KLine{
+		Symbol: "BTCUSDT",
+		Close:  fixedpoint.NewFromFloat(51000.0),
+	})
+	entity.KLineWindow = kLineWindow
+
+	// Create a position
+	position := &types.Position{
+		Symbol:             "BTCUSDT",
+		Base:               fixedpoint.NewFromFloat(1.0),
+		AverageCost:        fixedpoint.NewFromFloat(50000.0),
+		StrategyInstanceID: "test_strategy",
 	}
+
+	// Call createPositionClosedEvent method
+	event := entity.createPositionClosedEvent(position, CloseReasonTakeProfit)
+
+	// Verify the event
+	assert.Equal(t, EventPositionClosed, event.GetType())
+	
+	data := event.GetData()
+	positionClosedData, ok := data.(PositionClosedEventData)
+	assert.True(t, ok)
+	
+	assert.Equal(t, "BTCUSDT", positionClosedData.Symbol)
+	assert.Equal(t, 50000.0, positionClosedData.EntryPrice)
+	assert.Equal(t, 51000.0, positionClosedData.ExitPrice)
+	assert.Equal(t, 1.0, positionClosedData.Quantity)
+	assert.Equal(t, 1000.0, positionClosedData.ProfitAndLoss)
+	assert.Equal(t, CloseReasonTakeProfit, positionClosedData.CloseReason)
+	assert.Equal(t, "test_strategy", positionClosedData.StrategyID)
+	
+	// Check that timestamp is set
+	assert.NotZero(t, positionClosedData.Timestamp)
 }

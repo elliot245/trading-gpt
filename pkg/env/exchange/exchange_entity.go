@@ -22,6 +22,21 @@ import (
 
 var log = logrus.WithField("entity", "exchange")
 
+// EventEmitter defines the interface for emitting events
+type EventEmitter interface {
+	Emit(event ttypes.IEvent)
+}
+
+// ChannelEventEmitter implements EventEmitter using a channel
+type ChannelEventEmitter struct {
+	ch chan ttypes.IEvent
+}
+
+// Emit sends an event through the channel
+func (c *ChannelEventEmitter) Emit(event ttypes.IEvent) {
+	c.ch <- event
+}
+
 type ExchangeEntity struct {
 	symbol   string
 	interval types.Interval
@@ -38,6 +53,9 @@ type ExchangeEntity struct {
 	KLineWindow *types.KLineWindow
 
 	vm *goja.Runtime
+	
+	// For testing purposes
+	eventEmitter EventEmitter
 }
 
 func NewExchangeEntity(
@@ -58,7 +76,24 @@ func NewExchangeEntity(
 		orderExecutor: orderExecutor,
 		position:      NewPositionX(position),
 		vm:            goja.New(),
+		eventEmitter:  nil, // Will be set in Run method
 	}
+}
+
+// For testing purposes
+func NewExchangeEntityWithEventEmitter(
+	symbol string,
+	interval types.Interval,
+	leverage fixedpoint.Value,
+	cfg *config.EnvExchangeConfig,
+	session *bbgo.ExchangeSession,
+	orderExecutor *bbgo.GeneralOrderExecutor,
+	position *types.Position,
+	eventEmitter EventEmitter,
+) *ExchangeEntity {
+	entity := NewExchangeEntity(symbol, interval, leverage, cfg, session, orderExecutor, position)
+	entity.eventEmitter = eventEmitter
+	return entity
 }
 
 func (ent *ExchangeEntity) GetID() string {
@@ -311,6 +346,11 @@ func (ent *ExchangeEntity) HandleCommand(ctx context.Context, cmd string, args m
 func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 	session := ent.session
 
+	// Set up event emitter for normal operation
+	if ent.eventEmitter == nil {
+		ent.eventEmitter = &ChannelEventEmitter{ch: ch}
+	}
+
 	ent.Status = types.StrategyStatusRunning
 
 	ent.setupIndicators()
@@ -357,15 +397,15 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 
 		log.WithField("kline", kline).Info("kline closed")
 
-		ent.emitEvent(ch, ttypes.NewEvent("kline_changed", ent.KLineWindow))
+		ent.emitEvent(ttypes.NewEvent("kline_changed", ent.KLineWindow))
 
 		for _, indicator := range ent.Indicators {
-			ent.emitEvent(ch, ttypes.NewEvent("indicator_changed", indicator))
+			ent.emitEvent(ttypes.NewEvent("indicator_changed", indicator))
 		}
 
-		ent.emitEvent(ch, ttypes.NewEvent("position_changed", ent.position))
+		ent.emitEvent(ttypes.NewEvent("position_changed", ent.position))
 
-		ent.emitEvent(ch, ttypes.NewEvent("update_finish", nil))
+		ent.emitEvent(ttypes.NewEvent("update_finish", nil))
 	}))
 
 	// Handle position update
@@ -375,48 +415,11 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 		if position.IsClosed() {
 			log.WithField("position", position).Info("ExchangeEntity_PositionClose")
 
-			// Get the latest close price from KLineWindow
-			var exitPrice float64
-			if ent.KLineWindow != nil && ent.KLineWindow.Len() > 0 {
-				lastIdx := ent.KLineWindow.Len() - 1
-				exitPrice = (*ent.KLineWindow)[lastIdx].Close.Float64()
-			} else {
-				exitPrice = position.AverageCost.Float64() // Fallback if no kline data
-			}
-
-			// Determine position data for closed position event
-			positionData := PositionClosedEventData{
-				StrategyID:    position.StrategyInstanceID,
-				Symbol:        ent.symbol,
-				EntryPrice:    position.AverageCost.Float64(),
-				ExitPrice:     exitPrice,
-				Quantity:      position.Base.Float64(),
-				ProfitAndLoss: ent.position.AccumulatedProfit.Float64(),
-				CloseReason:   CloseReasonManual, // Default to Manual (will be overridden by the context in ClosePosition if available)
-				Timestamp:     time.Now(),
-			}
-
-			// Get recent market data as context if available
-			if ent.KLineWindow != nil && ent.KLineWindow.Len() > 0 {
-				lastIdx := ent.KLineWindow.Len() - 1
-				kline := (*ent.KLineWindow)[lastIdx]
-				positionData.RelatedMarketData = map[string]interface{}{
-					"lastKline": map[string]interface{}{
-						"open":      kline.Open.Float64(),
-						"high":      kline.High.Float64(),
-						"low":       kline.Low.Float64(),
-						"close":     kline.Close.Float64(),
-						"volume":    kline.Volume.Float64(),
-						"startTime": kline.StartTime.Time(),
-						"endTime":   kline.EndTime.Time(),
-					},
-				}
-			}
-
 			// Emit the position closed event
 			go func() {
-				log.WithField("positionData", positionData).Info("Emitting position_closed event")
-				ent.emitEvent(ch, NewPositionClosedEvent(positionData))
+				event := ent.createPositionClosedEvent(position, CloseReasonManual)
+				log.WithField("positionData", event.GetData()).Info("Emitting position_closed event")
+				ent.emitEvent(event)
 			}()
 
 			if ent.cfg.HandlePositionClose {
@@ -424,14 +427,14 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 					time.Sleep(time.Second * 5)
 					log.WithField("position", position).Info("ExchangeEntity_Handle_PositionClose")
 
-					ent.emitEvent(ch, ttypes.NewEvent("kline_changed", ent.KLineWindow))
+					ent.emitEvent(ttypes.NewEvent("kline_changed", ent.KLineWindow))
 
 					for _, indicator := range ent.Indicators {
-						ent.emitEvent(ch, ttypes.NewEvent("indicator_changed", indicator))
+						ent.emitEvent(ttypes.NewEvent("indicator_changed", indicator))
 					}
 
-					ent.emitEvent(ch, ttypes.NewEvent("position_changed", ent.position))
-					ent.emitEvent(ch, ttypes.NewEvent("update_finish", nil))
+					ent.emitEvent(ttypes.NewEvent("position_changed", ent.position))
+					ent.emitEvent(ttypes.NewEvent("update_finish", nil))
 				}()
 			}
 		}
@@ -603,8 +606,10 @@ func (ent *ExchangeEntity) setupIndicators() {
 	})
 }
 
-func (ent *ExchangeEntity) emitEvent(ch chan ttypes.IEvent, evt ttypes.IEvent) {
-	ch <- evt
+func (s *ExchangeEntity) emitEvent(evt ttypes.IEvent) {
+	if s.eventEmitter != nil {
+		s.eventEmitter.Emit(evt)
+	}
 }
 
 type StopLossPrice struct {
@@ -659,7 +664,6 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 	}
 
 	// Capture position info before closing for reflection event
-	posBeforeClose := *s.position
 	isFullClose := percentage.Compare(fixedpoint.One) == 0
 
 	// make it negative
@@ -692,56 +696,18 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 
 	// Only emit position closed event for full closures
 	if isFullClose {
-		// Get the strategy ID from context
-		strategyID := "unknown"
-		if val, exists := ctx.Value("strategyID").(string); exists {
-			strategyID = val
-		}
-
 		// Determine close reason based on available context
 		closeReason := CloseReasonManual // Default to Manual
 		if val, exists := ctx.Value("closeReason").(string); exists {
 			closeReason = val
 		}
-		if val, exists := ctx.Value("closeReason").(string); exists {
-			closeReason = val
-		}
-
-		// Create the position closed event data
-		positionData := PositionClosedEventData{
-			StrategyID:    strategyID,
-			Symbol:        s.symbol,
-			EntryPrice:    posBeforeClose.AverageCost.Float64(),
-			ExitPrice:     closePrice.Float64(),
-			Quantity:      posBeforeClose.GetBase().Float64(),
-			ProfitAndLoss: posBeforeClose.AccumulatedProfit.Float64(),
-			CloseReason:   closeReason,
-			Timestamp:     time.Now(),
-		}
-
-		// Get recent market data as context if available
-		if s.KLineWindow != nil && s.KLineWindow.Len() > 0 {
-			lastIdx := s.KLineWindow.Len() - 1
-			kline := (*s.KLineWindow)[lastIdx]
-			positionData.RelatedMarketData = map[string]interface{}{
-				"lastKline": map[string]interface{}{
-					"open":      kline.Open.Float64(),
-					"high":      kline.High.Float64(),
-					"low":       kline.Low.Float64(),
-					"close":     kline.Close.Float64(),
-					"volume":    kline.Volume.Float64(),
-					"startTime": kline.StartTime.Time(),
-					"endTime":   kline.EndTime.Time(),
-				},
-			}
-		}
 
 		// Emit the position closed event if we can access a channel
-		log.WithField("positionData", positionData).Info("Position fully closed, emitting PositionClosedEvent")
+		log.WithField("positionData", s.createPositionClosedEvent(s.position.Position, closeReason).GetData()).Info("Position fully closed, emitting PositionClosedEvent")
 
 		// Extract event channel from context if available
 		if eventCh, exists := ctx.Value("eventChannel").(chan ttypes.IEvent); exists {
-			eventCh <- NewPositionClosedEvent(positionData)
+			eventCh <- s.createPositionClosedEvent(s.position.Position, closeReason)
 		}
 	}
 
@@ -785,6 +751,49 @@ POSITION_CLOSED:
 	}
 
 	return nil
+}
+
+// createPositionClosedEvent creates a position closed event with all necessary data
+func (s *ExchangeEntity) createPositionClosedEvent(position *types.Position, closeReason string) *ttypes.Event {
+	// Get the latest close price from KLineWindow
+	var exitPrice float64
+	if s.KLineWindow != nil && s.KLineWindow.Len() > 0 {
+		lastIdx := s.KLineWindow.Len() - 1
+		exitPrice = (*s.KLineWindow)[lastIdx].Close.Float64()
+	} else {
+		exitPrice = position.AverageCost.Float64() // Fallback if no kline data
+	}
+
+	// Determine position data for closed position event
+	positionData := PositionClosedEventData{
+		StrategyID:    position.StrategyInstanceID,
+		Symbol:        s.symbol,
+		EntryPrice:    position.AverageCost.Float64(),
+		ExitPrice:     exitPrice,
+		Quantity:      position.Base.Float64(),
+		ProfitAndLoss: s.position.AccumulatedProfit.Float64(),
+		CloseReason:   closeReason,
+		Timestamp:     time.Now(),
+	}
+
+	// Get recent market data as context if available
+	if s.KLineWindow != nil && s.KLineWindow.Len() > 0 {
+		lastIdx := s.KLineWindow.Len() - 1
+		kline := (*s.KLineWindow)[lastIdx]
+		positionData.RelatedMarketData = map[string]interface{}{
+			"lastKline": map[string]interface{}{
+				"open":      kline.Open.Float64(),
+				"high":      kline.High.Float64(),
+				"low":       kline.Low.Float64(),
+				"close":     kline.Close.Float64(),
+				"volume":    kline.Volume.Float64(),
+				"startTime": kline.StartTime.Time(),
+				"endTime":   kline.EndTime.Time(),
+			},
+		}
+	}
+
+	return NewPositionClosedEvent(positionData)
 }
 
 func (s *ExchangeEntity) UpdatePositionV2(ctx context.Context, side types.SideType, closePrice fixedpoint.Value, args ...interface{}) error {
