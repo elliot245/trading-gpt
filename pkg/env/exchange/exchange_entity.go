@@ -881,7 +881,9 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 
 	if s.position.IsLong() {
 		side = types.SideTypeSell
-	} else {
+	} else if !s.backtestSpotSizing() {
+		// OKX margin market buys are sized in quote currency; the backtest
+		// matching engine sizes both sides in base quantity.
 		quantity = quantity.Mul(closePrice)
 	}
 
@@ -1110,6 +1112,20 @@ func (s *ExchangeEntity) calculateQuantity(ctx context.Context, currentPrice fix
 		return quoteQty.Div(currentPrice).
 			Mul(fixedpoint.NewFromFloat(0.99))
 	} else {
+		if s.backtestSpotSizing() {
+			// The backtest matching engine sizes market buys in base
+			// quantity, unlike OKX margin market buys (quote currency).
+			return quoteQty.Div(currentPrice).
+				Mul(fixedpoint.NewFromFloat(0.99))
+		}
+
 		return quoteQty
 	}
+}
+
+// backtestSpotSizing reports whether order sizing should follow bbgo's
+// spot-only backtest matching semantics (base-quantity sizing on both sides).
+// See config.EnvExchangeConfig.BacktestSpotSizing.
+func (s *ExchangeEntity) backtestSpotSizing() bool {
+	return s.cfg != nil && s.cfg.BacktestSpotSizing
 }

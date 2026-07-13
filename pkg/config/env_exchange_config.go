@@ -103,6 +103,15 @@ type EnvExchangeConfig struct {
 	CleanPosition       CleanPositionConfig         `json:"clean_position"`
 	WSHealth            WSHealthConfig              `json:"ws_health"`
 	RiskControl         RiskControlConfig           `json:"risk_control"`
+
+	// BacktestSpotSizing adapts order sizing for bbgo's backtest matching
+	// engine, which is spot-only and interprets SubmitOrder.Quantity as BASE
+	// quantity for both sides. The live OKX margin flow instead sizes market
+	// buys in QUOTE currency (open long, close short). When this flag is on:
+	//   - open long: quantity = quote/price (base), instead of quote
+	//   - close short: quantity = |base| (base), instead of |base|*price
+	// Never enable this against a live OKX session.
+	BacktestSpotSizing bool `json:"backtest_spot_sizing"`
 }
 
 // WSHealthConfig configures the WebSocket health watchdog. It is purely
