@@ -21,6 +21,7 @@ import (
 
 	"github.com/yubing744/trading-gpt/pkg/agents"
 	"github.com/yubing744/trading-gpt/pkg/agents/keeper"
+	"github.com/yubing744/trading-gpt/pkg/agents/scripted"
 	"github.com/yubing744/trading-gpt/pkg/agents/trading"
 	"github.com/yubing744/trading-gpt/pkg/config"
 	"github.com/yubing744/trading-gpt/pkg/env"
@@ -31,6 +32,7 @@ import (
 	"github.com/yubing744/trading-gpt/pkg/memory"
 	"github.com/yubing744/trading-gpt/pkg/utils"
 
+	"github.com/yubing744/trading-gpt/pkg/notify/console"
 	nfeishu "github.com/yubing744/trading-gpt/pkg/notify/feishu"
 	feishu_hook "github.com/yubing744/trading-gpt/pkg/notify/feishu-hook"
 	ttypes "github.com/yubing744/trading-gpt/pkg/types"
@@ -253,6 +255,27 @@ func (s *Strategy) setupWorld(ctx context.Context) error {
 }
 
 func (s *Strategy) setupAgent(ctx context.Context) error {
+	// Scripted replay agent for offline backtests: takes precedence over the
+	// LLM-backed agents so a backtest config can never accidentally call a
+	// live model.
+	scriptedCfg := s.Agent.Scripted
+	if scriptedCfg != nil && scriptedCfg.Enabled {
+		scriptedAgent, err := scripted.NewScriptedAgent(scriptedCfg)
+		if err != nil {
+			return errors.Wrap(err, "Error in create scripted agent")
+		}
+
+		s.agent = scriptedAgent
+
+		err = s.agent.Start()
+		if err != nil {
+			return errors.Wrap(err, "Error in init agent")
+		}
+
+		log.Info("scripted agent enabled; LLM agents are bypassed")
+		return nil
+	}
+
 	var tradingAgent *trading.TradingAgent
 	tradingCfg := &s.Agent.Trading
 	if tradingCfg != nil && tradingCfg.Enabled {
@@ -316,6 +339,22 @@ func (s *Strategy) setupMemory(ctx context.Context) error {
 }
 
 func (s *Strategy) setupNotify(ctx context.Context) error {
+	consoleNotifyCfg := s.Notify.Console
+	if consoleNotifyCfg != nil && consoleNotifyCfg.Enabled {
+		consoleNotifyChannel, err := console.NewConsoleNotifyChannel(consoleNotifyCfg)
+		if err != nil {
+			return errors.Wrap(err, "Error in create console notify channel")
+		}
+
+		chatSession := chat.NewChatSession(consoleNotifyChannel)
+		s.setupAdminSession(ctx, chatSession)
+		s.agentAction(ctx, chatSession, []*ttypes.Message{{
+			Text: "Please wait a moment while I prepare the market data. ",
+		}}, MaxRetryTime)
+
+		log.Info("init console notify channel ok!")
+	}
+
 	feishuNotifyCfg := s.Notify.Feishu
 	if feishuNotifyCfg != nil && feishuNotifyCfg.Enabled {
 		if os.Getenv("NOTIFY_FEISHU_APP_ID") != "" {
