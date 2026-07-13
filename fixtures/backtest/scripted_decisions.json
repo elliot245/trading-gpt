@@ -1,0 +1,42 @@
+{
+  "decisions": [
+    {
+      "at": "2026-07-07T02:00:00Z",
+      "action": {
+        "name": "open_long_position",
+        "args": {
+          "stop_loss_trigger_price": "3%",
+          "take_profit_trigger_price": "5%"
+        }
+      },
+      "speak": "Scripted: open long with 3% SL / 5% TP."
+    },
+    {
+      "at": "2026-07-07T12:00:00Z",
+      "action": {
+        "name": "close_position",
+        "args": {}
+      },
+      "speak": "Scripted: close the long."
+    },
+    {
+      "at": "2026-07-09T00:00:00Z",
+      "action": {
+        "name": "open_short_position",
+        "args": {
+          "stop_loss_trigger_price": "3%",
+          "take_profit_trigger_price": "5%"
+        }
+      },
+      "speak": "Scripted: open short with 3% SL / 5% TP."
+    },
+    {
+      "at": "2026-07-10T00:00:00Z",
+      "action": {
+        "name": "close_position",
+        "args": {}
+      },
+      "speak": "Scripted: close the short."
+    }
+  ]
+}

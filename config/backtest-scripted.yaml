@@ -1,0 +1,102 @@
+# Offline backtest config for the jarvis strategy (KR4 paper-verification
+# harness, scripted agent variant).
+#
+# - No live trading: bbgo `backtest` mode replaces the exchange with the
+#   built-in matching engine fed from klines synced into a local sqlite DB.
+# - No LLM calls: agent.scripted replays deterministic decisions from a
+#   fixture file (see fixtures/backtest/).
+# - No external notify: notify.console prints the decision stream to stdout
+#   and appends it to data/backtest-decisions.log.
+#
+# How to run: see docs/backtest-harness.md.
+
+logging:
+  trade: true
+  order: true
+
+persistence:
+  json:
+    directory: "./data/backtest/"
+
+sessions:
+  okex:
+    exchange: okex
+    envVarPrefix: okex
+    # NOTE: no margin here. bbgo's backtest matching engine is spot-only;
+    # shorts are emulated by pre-funding the backtest account with base
+    # currency (see backtest.accounts below).
+
+backtest:
+  startTime: "2026-07-06"
+  endTime: "2026-07-12"
+  symbols:
+    - SUIUSDT
+  sessions:
+    - okex
+  accounts:
+    okex:
+      balances:
+        USDT: 10000.0
+        # Base-currency float so that scripted/LLM "open_short_position"
+        # decisions can be executed by the spot-only matching engine
+        # (position tracking goes negative-base = short).
+        SUI: 20000.0
+
+exchangeStrategies:
+- on: okex
+  jarvis:
+    # llm section intentionally omitted: the scripted agent replaces the LLM
+    # and no API tokens are required.
+    env:
+      exchange:
+        kline_num: 50
+        backtest_spot_sizing: true
+        indicators:
+          VR3:
+            type: "vr"
+            max_num: 5
+            params:
+              interval: "5m"
+              windowSize: "3"
+          BOLL:
+            type: "boll"
+            max_num: 5
+            params:
+              interval: "5m"
+              window_size: "20"
+              band_width: "2.0"
+        handle_position_close: false
+        clean_position:
+          enabled: false
+          interval: 5m
+        ws_health:
+          # Wall-clock watchdog is meaningless against replayed klines.
+          disabled: true
+      include_events:
+        - kline_changed
+        - indicator_changed
+        - position_changed
+        - update_finish
+    agent:
+      scripted:
+        enabled: true
+        name: "ScriptedAI"
+        fixture_file: "fixtures/backtest/scripted_decisions.json"
+    notify:
+      console:
+        enabled: true
+        log_file: "data/backtest-decisions.log"
+    symbol: SUIUSDT
+    interval: 5m
+    subscribe_intervals: []
+    leverage: 3
+    max_num: 50
+    reflection_enabled: false
+    read_memory_enabled: false
+    memory:
+      enabled: false
+    strategy: |
+      Scripted replay run: decisions come from the fixture file, this text is
+      kept only because the prompt template requires a strategy description.
+    strategy_attention_points:
+      - Scripted replay; decisions are deterministic and fixture-driven.
