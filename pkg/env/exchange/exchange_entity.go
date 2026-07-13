@@ -37,7 +37,8 @@ type ExchangeEntity struct {
 	Indicators  []*ExchangeIndicator
 	KLineWindow *types.KLineWindow
 
-	vm *goja.Runtime
+	vm         *goja.Runtime
+	orderDedup *orderDedupGuard // Idempotency guard for order submissions (#94)
 }
 
 func NewExchangeEntity(
@@ -58,7 +59,20 @@ func NewExchangeEntity(
 		orderExecutor: orderExecutor,
 		position:      NewPositionX(position),
 		vm:            goja.New(),
+		orderDedup:    newOrderDedupGuard(),
 	}
+}
+
+// currentCycle returns the start time of the most recent kline, used as the
+// idempotency cycle boundary for order deduplication. It returns the zero time
+// when no kline data is available, which disables deduplication for that call
+// and preserves the legacy submission behaviour.
+func (s *ExchangeEntity) currentCycle() time.Time {
+	if s.KLineWindow == nil || s.KLineWindow.Len() == 0 {
+		return time.Time{}
+	}
+
+	return s.KLineWindow.Last().StartTime.Time()
 }
 
 func (ent *ExchangeEntity) GetID() string {
@@ -618,6 +632,18 @@ type TakeProfitPrice struct {
 func (s *ExchangeEntity) OpenPosition(ctx context.Context, side types.SideType, closePrice fixedpoint.Value, args ...interface{}) error {
 	quantity := s.calculateQuantity(ctx, closePrice, side)
 
+	// Idempotency guard (#94): suppress duplicate open submissions for the same
+	// side within the same kline cycle (e.g. a repeated signal dispatch or a
+	// network-retried command). Claimed before the submit loop so the
+	// Insufficient-USDT retry below is not self-blocked.
+	if key, first := s.orderDedup.claim(s.symbol, OpenIntent(side), s.currentCycle()); !first {
+		log.WithField("idempotencyKey", key).
+			WithField("symbol", s.symbol).
+			WithField("side", side.String()).
+			Warn("skip duplicate open position submission within the same kline cycle")
+		return nil
+	}
+
 	for {
 		if quantity.Compare(s.position.Market.MinQuantity) < 0 {
 			return fmt.Errorf("%s order quantity %v is too small, less than %v", s.symbol, quantity, s.position.Market.MinQuantity)
@@ -691,6 +717,18 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 		side = types.SideTypeSell
 	} else {
 		quantity = quantity.Mul(closePrice)
+	}
+
+	// Idempotency guard (#94): suppress duplicate close submissions for the same
+	// close percentage within the same kline cycle (e.g. a network-retried close
+	// command or a re-triggered TP/SL). Distinct partial-close percentages map to
+	// distinct intents and are not blocked.
+	if key, first := s.orderDedup.claim(s.symbol, CloseIntent(percentage), s.currentCycle()); !first {
+		log.WithField("idempotencyKey", key).
+			WithField("symbol", s.symbol).
+			WithField("percentage", percentage.Float64()).
+			Warn("skip duplicate close position submission within the same kline cycle")
+		return nil
 	}
 
 	orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeAutoRepay)
