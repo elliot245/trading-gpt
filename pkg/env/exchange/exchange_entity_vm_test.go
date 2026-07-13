@@ -30,11 +30,14 @@ func TestEvalWithVM_ConcurrentNoRace(t *testing.T) {
 			defer wg.Done()
 
 			closePrice := fixedpoint.NewFromInt(int64(100 + idx))
-			// ParsePrice sets variables on the shared vm and then evaluates,
-			// so the whole set+eval sequence must be serialized by evalWithVM.
+			// Callers set variables on the shared vm and then evaluate, so the
+			// whole set+eval sequence must be serialized by evalWithVM.
 			// Use a non-integral multiplier so goja exports a float64 result.
 			val, err := ent.evalWithVM(func(vm *goja.Runtime) (*fixedpoint.Value, error) {
-				return utils.ParsePrice(vm, nil, closePrice, "last_close * 0.995")
+				if err := vm.Set("last_close", closePrice.Float64()); err != nil {
+					return nil, err
+				}
+				return utils.ArgToFixedpoint(vm, "last_close * 0.995")
 			})
 			if err != nil {
 				errs[idx] = err

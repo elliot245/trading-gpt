@@ -322,64 +322,6 @@ func (ent *ExchangeEntity) HandleCommand(ctx context.Context, cmd string, args m
 			}
 		}
 
-<<<<<<< HEAD
-=======
-		// config order type
-		if orderType, ok := args["order_type"]; ok && orderType != "" {
-			opts = append(opts, &OrderTypeOpt{
-				Type: types.OrderType(strings.ToUpper(orderType)),
-			})
-		}
-
-		// config limit price
-		if limitPrice, ok := args["limit_price"]; ok && limitPrice != "" {
-			price, err := ent.evalWithVM(func(vm *goja.Runtime) (*fixedpoint.Value, error) {
-				return utils.ParsePrice(vm, ent.KLineWindow, closePrice, limitPrice)
-			})
-			if err != nil {
-				return errors.Wrapf(err, "invalid limit_price: %s", limitPrice)
-			}
-
-			if price != nil {
-				opts = append(opts, &LimitPriceOpt{
-					Value: *price,
-				})
-			}
-		}
-
-		// config time in force
-		if timeInForce, ok := args["time_in_force"]; ok && timeInForce != "" {
-			opts = append(opts, &TimeInForceOpt{
-				Value: types.TimeInForce(strings.ToUpper(timeInForce)),
-			})
-		}
-
-		// config post only
-		if postOnly, ok := args["post_only"]; ok && postOnly != "" {
-			opts = append(opts, &PostOnlyOpt{
-				Enabled: strings.EqualFold(postOnly, "true"),
-			})
-		}
-
-		if quoteRatio != nil {
-			opts = append(opts, &QuoteRatioOpt{
-				Value: *quoteRatio,
-			})
-
-			log.
-				WithField("ratio", quoteRatio.Float64()).
-				WithField("symbol", ent.symbol).
-				Debug("apply quote_ratio sizing")
-		}
-
-		// Validation: order_type=limit requires limit_price
-		if ot, ok := args["order_type"]; ok && strings.ToUpper(ot) == "LIMIT" {
-			if lp, ok := args["limit_price"]; !ok || lp == "" {
-				return errors.New("limit_price is required when order_type=limit")
-			}
-		}
-
->>>>>>> 1eb46c6 (fix(exchange): add goja eval timeout and serialize shared runtime (#92, #93))
 		log.Infof("open %s position for signal %v, options: %v", ent.symbol, side, opts)
 
 		if cmd == "open_long_position" || cmd == "open_short_position" {
@@ -521,21 +463,17 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 				}
 			}
 
-<<<<<<< HEAD
-=======
-			ent.updatePositionFundRatios(ctx, fixedpoint.NewFromFloat(exitPrice))
-
 			// Feed realized PnL to the hard risk gate so the daily-loss
 			// kill-switch (issue #86 / KR3) can trip. Recording only; no order.
 			if ent.riskGate != nil {
-				ent.riskGate.RecordRealizedPnL(ent.position.AccumulatedProfitValue)
+				ent.riskGate.RecordRealizedPnL(ent.position.AccumulatedProfit)
 				if ent.riskGate.KillSwitchActive() {
 					log.Warnf("risk_gate: daily-loss kill-switch is ACTIVE for %s; new open orders will be rejected until next trading day", ent.symbol)
 					bbgo.Notify("[RISK] daily-loss kill-switch ACTIVE for %s; blocking new opens until next trading day", ent.symbol)
 				}
 			}
 
->>>>>>> c78365b (feat(exchange): add code-level hard risk-control gate & kill-switch (#86))
+
 			// Emit the position closed event
 			go func() {
 				log.WithField("positionData", positionData).Info("Emitting position_closed event")
@@ -843,13 +781,11 @@ func (s *ExchangeEntity) OpenPosition(ctx context.Context, side types.SideType, 
 		return nil
 	}
 
-<<<<<<< HEAD
-=======
 	// Hard risk gate (issue #86 / KR3): a code-level, LLM-independent defensive
 	// check. If any configured limit is breached the order is rejected here and
 	// NOT submitted. This never triggers any active order/close on its own.
 	if s.riskGate != nil {
-		orderNotional := s.calculateOrderNotional(ctx, quoteRatio)
+		orderNotional := s.calculateOrderNotional(ctx, nil)
 		positionNotional := s.position.GetBase().Abs().Mul(closePrice)
 		decision := s.riskGate.Evaluate(orderNotional, positionNotional, s.leverage)
 		if !decision.Allow {
@@ -873,9 +809,7 @@ func (s *ExchangeEntity) OpenPosition(ctx context.Context, side types.SideType, 
 		}
 	}
 
-	quantity := s.calculateQuantity(ctx, closePrice, side, quoteRatio)
 
->>>>>>> c78365b (feat(exchange): add code-level hard risk-control gate & kill-switch (#86))
 	for {
 		if quantity.Compare(s.position.Market.MinQuantity) < 0 {
 			return fmt.Errorf("%s order quantity %v is too small, less than %v", s.symbol, quantity, s.position.Market.MinQuantity)
