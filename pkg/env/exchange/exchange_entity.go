@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
@@ -38,6 +39,7 @@ type ExchangeEntity struct {
 	KLineWindow *types.KLineWindow
 
 	vm         *goja.Runtime
+	vmMu       sync.Mutex       // serializes access to vm; goja.Runtime is not thread-safe (issue #93)
 	orderDedup *orderDedupGuard // Idempotency guard for order submissions (#94)
 
 	wsHealth *WSHealthMonitor // Tracks WebSocket reconnect churn and market-data gaps
@@ -200,6 +202,18 @@ func (ent *ExchangeEntity) Actions() []*ttypes.ActionDesc {
 	}
 }
 
+// evalWithVM serializes access to the shared goja runtime (ent.vm) so that
+// concurrent command handling cannot race on it (issue #93). The runtime is not
+// safe for concurrent use, and callers set variables on it before evaluating an
+// expression, so the whole set+eval sequence must be held under the lock. The
+// per-eval timeout that guards against runaway scripts (issue #92) lives in
+// utils.ArgToFixedpoint.
+func (ent *ExchangeEntity) evalWithVM(fn func(vm *goja.Runtime) (*fixedpoint.Value, error)) (*fixedpoint.Value, error) {
+	ent.vmMu.Lock()
+	defer ent.vmMu.Unlock()
+	return fn(ent.vm)
+}
+
 func (ent *ExchangeEntity) cmdToSide(cmd string) types.SideType {
 	switch cmd {
 	case "open_long_position":
@@ -276,7 +290,9 @@ func (ent *ExchangeEntity) HandleCommand(ctx context.Context, cmd string, args m
 
 		// config stop losss
 		if stopLoss, ok := args["stop_loss_trigger_price"]; ok && stopLoss != "" {
-			stopLoss, err := utils.ParseStopLoss(ent.vm, side, closePrice, stopLoss)
+			stopLoss, err := ent.evalWithVM(func(vm *goja.Runtime) (*fixedpoint.Value, error) {
+				return utils.ParseStopLoss(vm, side, closePrice, stopLoss)
+			})
 			if err != nil {
 				return errors.Wrapf(err, "the stop loss invalid: %s", stopLoss)
 			}
@@ -290,7 +306,9 @@ func (ent *ExchangeEntity) HandleCommand(ctx context.Context, cmd string, args m
 
 		// config take profix
 		if takeProfix, ok := args["take_profit_trigger_price"]; ok && takeProfix != "" {
-			takeProfix, err := utils.ParseTakeProfit(ent.vm, side, closePrice, takeProfix)
+			takeProfix, err := ent.evalWithVM(func(vm *goja.Runtime) (*fixedpoint.Value, error) {
+				return utils.ParseTakeProfit(vm, side, closePrice, takeProfix)
+			})
 			if err != nil {
 				return errors.Wrapf(err, "the take profit invalid: %s", takeProfix)
 			}
@@ -302,6 +320,64 @@ func (ent *ExchangeEntity) HandleCommand(ctx context.Context, cmd string, args m
 			}
 		}
 
+<<<<<<< HEAD
+=======
+		// config order type
+		if orderType, ok := args["order_type"]; ok && orderType != "" {
+			opts = append(opts, &OrderTypeOpt{
+				Type: types.OrderType(strings.ToUpper(orderType)),
+			})
+		}
+
+		// config limit price
+		if limitPrice, ok := args["limit_price"]; ok && limitPrice != "" {
+			price, err := ent.evalWithVM(func(vm *goja.Runtime) (*fixedpoint.Value, error) {
+				return utils.ParsePrice(vm, ent.KLineWindow, closePrice, limitPrice)
+			})
+			if err != nil {
+				return errors.Wrapf(err, "invalid limit_price: %s", limitPrice)
+			}
+
+			if price != nil {
+				opts = append(opts, &LimitPriceOpt{
+					Value: *price,
+				})
+			}
+		}
+
+		// config time in force
+		if timeInForce, ok := args["time_in_force"]; ok && timeInForce != "" {
+			opts = append(opts, &TimeInForceOpt{
+				Value: types.TimeInForce(strings.ToUpper(timeInForce)),
+			})
+		}
+
+		// config post only
+		if postOnly, ok := args["post_only"]; ok && postOnly != "" {
+			opts = append(opts, &PostOnlyOpt{
+				Enabled: strings.EqualFold(postOnly, "true"),
+			})
+		}
+
+		if quoteRatio != nil {
+			opts = append(opts, &QuoteRatioOpt{
+				Value: *quoteRatio,
+			})
+
+			log.
+				WithField("ratio", quoteRatio.Float64()).
+				WithField("symbol", ent.symbol).
+				Debug("apply quote_ratio sizing")
+		}
+
+		// Validation: order_type=limit requires limit_price
+		if ot, ok := args["order_type"]; ok && strings.ToUpper(ot) == "LIMIT" {
+			if lp, ok := args["limit_price"]; !ok || lp == "" {
+				return errors.New("limit_price is required when order_type=limit")
+			}
+		}
+
+>>>>>>> 1eb46c6 (fix(exchange): add goja eval timeout and serialize shared runtime (#92, #93))
 		log.Infof("open %s position for signal %v, options: %v", ent.symbol, side, opts)
 
 		if cmd == "open_long_position" || cmd == "open_short_position" {
