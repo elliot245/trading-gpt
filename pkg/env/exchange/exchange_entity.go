@@ -918,6 +918,27 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 		return err
 	}
 
+	// Verify-after-close invariant (#103 follow-up): a full close may only be
+	// reported as success — and the position-closed event may only be emitted —
+	// after the exchange positively confirms the net position is flat. If the
+	// confirmation fails, return an error so callers report the close as
+	// unconfirmed instead of "executed successfully"; a retried close is safe
+	// (reduce-only sizing no-ops on a flat account and the idempotency guard
+	// dedupes within the same kline cycle).
+	if isFullClose {
+		if verifyErr := verifyClosedWithRetry(
+			ctx,
+			s.queryAuthoritativeNetBase,
+			s.position.Market.MinQuantity,
+			defaultCloseVerifyAttempts,
+			defaultCloseVerifyInterval,
+		); verifyErr != nil {
+			log.WithError(verifyErr).Errorf("close order submitted for %s but position NOT confirmed closed", s.symbol)
+			bbgo.Notify("[RISK] %s close order submitted but NOT confirmed closed: %s", s.symbol, verifyErr.Error())
+			return errors.Wrap(verifyErr, "close order submitted but position not confirmed closed")
+		}
+	}
+
 	// Only emit position closed event for full closures
 	if isFullClose {
 		// Get the strategy ID from context
