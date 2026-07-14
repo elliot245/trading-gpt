@@ -901,6 +901,13 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 	if isFullClose {
 		orderForm.ClosePosition = true // Full close position
 	}
+	if sizing.ReduceOnly {
+		// #103: the authoritative net read disagreed with a non-dust internal base
+		// (it under-reported an open position as flat). We size off the internal
+		// base to still close a real position, but force reduce-only so the order
+		// can never open an opposite position if the internal base is the stale one.
+		orderForm.ReduceOnly = true
+	}
 
 	bbgo.Notify("submitting %s %s order to close position by %v, orderForm:%v", s.symbol, side.String(), percentage, orderForm)
 
