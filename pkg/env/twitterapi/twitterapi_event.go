@@ -1,10 +1,8 @@
 package twitterapi
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/yubing744/trading-gpt/pkg/types"
+	"github.com/yubing744/trading-gpt/pkg/utils"
 )
 
 // TwitterAPIEvent represents an event that is specific to interactions with the Twitter API platform.
@@ -23,12 +21,9 @@ func NewTwitterAPIEvent(name string, title string, content string) *TwitterAPIEv
 	}
 }
 
-// ToPrompts is overridden to include the message content in the prompts for TwitterAPIEvent.
+// ToPrompts wraps the external content in an explicit untrusted-data isolation
+// block so any injected instruction inside tweets is treated as data, not a
+// command, and the content cannot forge prompt structure. See utils.WrapUntrusted.
 func (e *TwitterAPIEvent) ToPrompts() []string {
-	sb := strings.Builder{}
-
-	sb.WriteString(fmt.Sprintf("%s\n", e.title))
-	sb.WriteString(e.Content)
-
-	return []string{sb.String()}
+	return []string{utils.WrapUntrusted(e.title, e.Content, 4000)}
 }

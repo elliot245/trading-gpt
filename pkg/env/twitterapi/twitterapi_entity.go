@@ -10,6 +10,7 @@ import (
 	"github.com/yubing744/trading-gpt/pkg/apis/twitterapi"
 	"github.com/yubing744/trading-gpt/pkg/config"
 	"github.com/yubing744/trading-gpt/pkg/types"
+	"github.com/yubing744/trading-gpt/pkg/utils"
 )
 
 var log = logrus.WithField("entity", "twitterapi")
@@ -120,20 +121,25 @@ func (e *TwitterAPIEntity) formatTweets(tweets []twitterapi.Tweet, maxResults in
 	for i := 0; i < count; i++ {
 		tweet := tweets[i]
 		sb.WriteString(fmt.Sprintf("Tweet %d:\n", i+1))
-		sb.WriteString(fmt.Sprintf("Author: @%s (%s)\n", tweet.Author.UserName, tweet.Author.Name))
-		sb.WriteString(fmt.Sprintf("Text: %s\n", tweet.Text))
+		// Sanitize all externally-controlled fields (#87 prompt-injection): tweet
+		// bodies/authors/hashtags are attacker-controllable and must not carry raw
+		// control chars, injected role markers, or unbounded bulk text into the LLM.
+		sb.WriteString(fmt.Sprintf("Author: @%s (%s)\n",
+			utils.SanitizeUntrusted(tweet.Author.UserName, 40),
+			utils.SanitizeUntrusted(tweet.Author.Name, 60)))
+		sb.WriteString(fmt.Sprintf("Text: %s\n", utils.SanitizeUntrusted(tweet.Text, 500)))
 		sb.WriteString(fmt.Sprintf("Engagement: %d likes, %d retweets, %d replies\n", tweet.LikeCount, tweet.RetweetCount, tweet.ReplyCount))
 
 		// Parse and format creation time with relative time
 		relativeTime := e.formatRelativeTime(tweet.CreatedAt, now)
-		sb.WriteString(fmt.Sprintf("Created: %s (%s)\n", tweet.CreatedAt, relativeTime))
+		sb.WriteString(fmt.Sprintf("Created: %s (%s)\n", utils.SanitizeUntrusted(tweet.CreatedAt, 40), relativeTime))
 
-		sb.WriteString(fmt.Sprintf("URL: %s\n", tweet.URL))
+		sb.WriteString(fmt.Sprintf("URL: %s\n", utils.SanitizeUntrusted(tweet.URL, 200)))
 
 		if len(tweet.Entities.Hashtags) > 0 {
 			hashtags := make([]string, len(tweet.Entities.Hashtags))
 			for i, h := range tweet.Entities.Hashtags {
-				hashtags[i] = h.Text
+				hashtags[i] = utils.SanitizeUntrusted(h.Text, 40)
 			}
 			sb.WriteString(fmt.Sprintf("Hashtags: %s\n", strings.Join(hashtags, ", ")))
 		}
