@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/yubing744/trading-gpt/pkg/risk"
 )
 
 type IndicatorType string
@@ -100,6 +101,7 @@ type EnvExchangeConfig struct {
 	Indicators          map[string]*IndicatorConfig `json:"indicators"`
 	HandlePositionClose bool                        `json:"handle_position_close"`
 	CleanPosition       CleanPositionConfig         `json:"clean_position"`
+	RiskGate            risk.Config                 `json:"risk_gate"`
 }
 
 type CleanPositionConfig struct {

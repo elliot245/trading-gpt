@@ -23,6 +23,8 @@ otp.png
 
 data/
 vendor/
+memory-bank/risk-gate-state.json
+memory-bank/risk-gate-state.json.tmp
 
 # cursor
 .cursor/
