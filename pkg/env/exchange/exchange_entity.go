@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/yubing744/trading-gpt/pkg/config"
+	"github.com/yubing744/trading-gpt/pkg/risk"
 	"github.com/yubing744/trading-gpt/pkg/utils"
 
 	ttypes "github.com/yubing744/trading-gpt/pkg/types"
@@ -32,6 +33,8 @@ type ExchangeEntity struct {
 	session       *bbgo.ExchangeSession
 	orderExecutor *bbgo.GeneralOrderExecutor
 	position      *PositionX
+	riskGate      *risk.Gate
+	closeReason   string
 
 	Status      types.StrategyStatus
 	Indicators  []*ExchangeIndicator
@@ -49,6 +52,10 @@ func NewExchangeEntity(
 	orderExecutor *bbgo.GeneralOrderExecutor,
 	position *types.Position,
 ) *ExchangeEntity {
+	if cfg == nil {
+		cfg = &config.EnvExchangeConfig{}
+	}
+
 	return &ExchangeEntity{
 		symbol:        symbol,
 		interval:      interval,
@@ -57,6 +64,7 @@ func NewExchangeEntity(
 		session:       session,
 		orderExecutor: orderExecutor,
 		position:      NewPositionX(position),
+		riskGate:      risk.NewGate(cfg.RiskGate),
 		vm:            goja.New(),
 	}
 }
@@ -572,6 +580,18 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 		ent.emitEvent(ch, ttypes.NewEvent("update_finish", nil))
 	}))
 
+	ent.orderExecutor.TradeCollector().OnProfit(func(trade types.Trade, profit *types.Profit) {
+		if profit == nil {
+			return
+		}
+
+		ent.position.RecordRealizedQuotePnL(profit.NetProfit, profit.Quantity, profit.AverageCost)
+		log.WithField("tradeID", trade.ID).
+			WithField("netProfit", profit.NetProfit.String()).
+			WithField("quoteCurrency", profit.QuoteCurrency).
+			Info("recorded authoritative quote-currency realized pnl")
+	})
+
 	// Handle position update
 	ent.orderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
 		log.WithField("position", position).Info("ExchangeEntity_OnPositionUpdate")
@@ -588,16 +608,38 @@ func (ent *ExchangeEntity) Run(ctx context.Context, ch chan ttypes.IEvent) {
 				exitPrice = position.AverageCost.Float64() // Fallback if no kline data
 			}
 
+			realizedQuotePnL, realizedQuantity, realizedEntryNotional := ent.position.ConsumeRealizedQuotePnL()
+			if realizedQuotePnL.IsZero() {
+				log.Warn("closed position has zero authoritative realized quote pnl; keeping zero instead of percentage-style fallback")
+			}
+
+			if ent.riskGate != nil {
+				if err := ent.riskGate.RecordRealizedPnL(time.Now().UTC(), realizedQuotePnL); err != nil {
+					log.WithError(err).Error("risk gate failed to persist realized quote pnl")
+				}
+			}
+
+			profitPercent := fixedpoint.Zero
+			if !realizedEntryNotional.IsZero() {
+				profitPercent = realizedQuotePnL.Div(realizedEntryNotional).Mul(fixedpoint.NewFromInt(100))
+			}
+
+			closeReason := ent.closeReason
+			if closeReason == "" {
+				closeReason = CloseReasonManual
+			}
+			ent.closeReason = ""
+
 			// Determine position data for closed position event
 			positionData := PositionClosedEventData{
 				StrategyID:           position.StrategyInstanceID,
 				Symbol:               ent.symbol,
 				EntryPrice:           position.AverageCost.Float64(),
 				ExitPrice:            exitPrice,
-				Quantity:             position.Base.Float64(),
-				ProfitAndLoss:        ent.position.AccumulatedProfitValue.Float64(),
-				ProfitAndLossPercent: ent.position.AccumulatedProfit.Float64(),
-				CloseReason:          CloseReasonManual, // Default to Manual (will be overridden by the context in ClosePosition if available)
+				Quantity:             realizedQuantity.Float64(),
+				ProfitAndLoss:        realizedQuotePnL.Float64(),
+				ProfitAndLossPercent: profitPercent.Float64(),
+				CloseReason:          closeReason,
 				Timestamp:            time.Now(),
 			}
 
@@ -869,49 +911,47 @@ type PostOnlyOpt struct {
 }
 
 func (s *ExchangeEntity) OpenPosition(ctx context.Context, side types.SideType, closePrice fixedpoint.Value, args ...interface{}) error {
-	quantity := s.calculateQuantity(ctx, closePrice, side)
+	if s.riskGate == nil {
+		s.riskGate = risk.NewGate(risk.Config{})
+	}
 
-	for {
-		if quantity.Compare(s.position.Market.MinQuantity) < 0 {
-			return fmt.Errorf("%s order quantity %v is too small, less than %v", s.symbol, quantity, s.position.Market.MinQuantity)
+	quantity, err := s.riskGate.ReserveOpen(time.Now().UTC())
+	if err != nil {
+		log.WithError(err).Error("risk gate rejected open position")
+		return err
+	}
+
+	if quantity.Compare(s.position.Market.MinQuantity) < 0 {
+		return fmt.Errorf("%s order quantity %v is too small, less than %v", s.symbol, quantity, s.position.Market.MinQuantity)
+	}
+
+	orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeMarginBuy)
+
+	for _, arg := range args {
+		switch val := arg.(type) {
+		case *StopLossPrice:
+			orderForm.StopPrice = val.Value
+		case *TakeProfitPrice:
+			orderForm.TakePrice = val.Value
+		case *OrderTypeOpt:
+			orderForm.Type = val.Type
+		case *LimitPriceOpt:
+			orderForm.Price = val.Value
+		case *TimeInForceOpt:
+			orderForm.TimeInForce = val.Value
+		case *PostOnlyOpt:
+			// Note: PostOnly is not directly supported in bbgo's SubmitOrder
+			// Some exchanges may support it through TimeInForce=POST_ONLY
+			// For now, we accept the parameter but don't apply it
+			log.WithField("post_only", val.Enabled).Debug("post_only parameter received but not applied (not supported by bbgo SubmitOrder)")
 		}
+	}
 
-		orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeMarginBuy)
-
-		for _, arg := range args {
-			switch val := arg.(type) {
-			case *StopLossPrice:
-				orderForm.StopPrice = val.Value
-			case *TakeProfitPrice:
-				orderForm.TakePrice = val.Value
-			case *OrderTypeOpt:
-				orderForm.Type = val.Type
-			case *LimitPriceOpt:
-				orderForm.Price = val.Value
-			case *TimeInForceOpt:
-				orderForm.TimeInForce = val.Value
-			case *PostOnlyOpt:
-				// Note: PostOnly is not directly supported in bbgo's SubmitOrder
-				// Some exchanges may support it through TimeInForce=POST_ONLY
-				// For now, we accept the parameter but don't apply it
-				log.WithField("post_only", val.Enabled).Debug("post_only parameter received but not applied (not supported by bbgo SubmitOrder)")
-			}
-		}
-
-		log.Infof("submit open position order %v", orderForm)
-		_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
-		if err != nil {
-			if strings.Contains(err.Error(), "Insufficient USDT") {
-				log.WithField("quantity", quantity.Float64()).Error("Insufficient USDT, try reduce order quantity")
-				quantity = quantity.Mul(fixedpoint.NewFromFloat(0.99))
-				continue
-			}
-
-			log.WithError(err).Errorf("can not place %s open position order", s.symbol)
-			return err
-		}
-
-		break
+	log.WithField("baseQuantity", quantity.String()).Infof("submit risk-gated open position order %v", orderForm)
+	_, err = s.orderExecutor.SubmitOrders(ctx, orderForm)
+	if err != nil {
+		log.WithError(err).Errorf("can not place %s open position order", s.symbol)
+		return err
 	}
 
 	return nil
@@ -922,8 +962,6 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 		return fmt.Errorf("no opened %s position", s.position.Symbol)
 	}
 
-	// Capture position info before closing for reflection event
-	posBeforeClose := *s.position
 	isFullClose := percentage.Compare(fixedpoint.One) == 0
 
 	// make it negative
@@ -943,71 +981,27 @@ func (s *ExchangeEntity) ClosePosition(ctx context.Context, percentage fixedpoin
 	orderForm := s.generateOrderForm(side, quantity, types.SideEffectTypeAutoRepay)
 	if isFullClose {
 		orderForm.ClosePosition = true // Full close position
+		closeReason := CloseReasonManual
+		if val, exists := ctx.Value("closeReason").(string); exists {
+			closeReason = val
+		}
+		s.closeReason = closeReason
 	}
 
 	bbgo.Notify("submitting %s %s order to close position by %v, orderForm:%v", s.symbol, side.String(), percentage, orderForm)
 
 	_, err := s.orderExecutor.SubmitOrders(ctx, orderForm)
 	if err != nil {
+		if isFullClose {
+			s.closeReason = ""
+		}
 		log.WithError(err).Errorf("can not place %s position close order", s.symbol)
 		bbgo.Notify("can not place %s position close order", s.symbol)
 		return err
 	}
 
-	// Only emit position closed event for full closures
 	if isFullClose {
-		// Get the strategy ID from context
-		strategyID := "unknown"
-		if val, exists := ctx.Value("strategyID").(string); exists {
-			strategyID = val
-		}
-
-		// Determine close reason based on available context
-		closeReason := CloseReasonManual // Default to Manual
-		if val, exists := ctx.Value("closeReason").(string); exists {
-			closeReason = val
-		}
-		if val, exists := ctx.Value("closeReason").(string); exists {
-			closeReason = val
-		}
-
-		// Create the position closed event data
-		positionData := PositionClosedEventData{
-			StrategyID:           strategyID,
-			Symbol:               s.symbol,
-			EntryPrice:           posBeforeClose.AverageCost.Float64(),
-			ExitPrice:            closePrice.Float64(),
-			Quantity:             posBeforeClose.GetBase().Float64(),
-			ProfitAndLoss:        posBeforeClose.AccumulatedProfitValue.Float64(),
-			ProfitAndLossPercent: posBeforeClose.AccumulatedProfit.Float64(),
-			CloseReason:          closeReason,
-			Timestamp:            time.Now(),
-		}
-
-		// Get recent market data as context if available
-		if s.KLineWindow != nil && s.KLineWindow.Len() > 0 {
-			lastIdx := s.KLineWindow.Len() - 1
-			kline := (*s.KLineWindow)[lastIdx]
-			positionData.RelatedMarketData = map[string]interface{}{
-				"lastKline": map[string]interface{}{
-					"open":      kline.Open.Float64(),
-					"high":      kline.High.Float64(),
-					"low":       kline.Low.Float64(),
-					"close":     kline.Close.Float64(),
-					"volume":    kline.Volume.Float64(),
-					"startTime": kline.StartTime.Time(),
-					"endTime":   kline.EndTime.Time(),
-				},
-			}
-		}
-
-		// Emit the position closed event if we can access a channel
-		log.WithField("positionData", positionData).Info("Position fully closed, emitting PositionClosedEvent")
-
-		// Extract event channel from context if available
-		if eventCh, exists := ctx.Value("eventChannel").(chan ttypes.IEvent); exists {
-			eventCh <- NewPositionClosedEvent(positionData)
-		}
+		log.Info("full close submitted; waiting for trade collector position update before emitting authoritative realized pnl event")
 	}
 
 	return err
